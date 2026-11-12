@@ -94,15 +94,23 @@ def main():
 
     try:
         prepared = prepare_product(read_json(args.path))
+        product = prepared["product"]
+        has_description = bool((product["description"] or "").strip())
+        has_specs = any(value.strip() for value in product["specs"].values())
+        is_incomplete = not (has_description or has_specs)
         result = {
-            **generate_card_text(prepared),
-            "specs": prepared["product"]["specs"],
+            **generate_card_text(prepared, allow_short_description=is_incomplete),
+            "specs": product["specs"],
             "fieldsToClarify": prepared["fieldsToClarify"],
         }
+        if is_incomplete:
+            result["isIncomplete"] = True
     except (InputError, LLMError) as error:
         details = {"message": str(error)}
         if isinstance(error, InputError) and error.field is not None:
             details["field"] = error.field
+        if isinstance(error, LLMError) and error.details:
+            details["details"] = error.details
         print(json.dumps({"error": details}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
 
