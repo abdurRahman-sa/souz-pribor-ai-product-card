@@ -96,8 +96,8 @@ def main():
         prepared = prepare_product(read_json(args.path))
         product = prepared["product"]
         has_description = bool((product["description"] or "").strip())
-        has_specs = any(value.strip() for value in product["specs"].values())
-        is_incomplete = not (has_description or has_specs)
+        filled_spec_count = sum(1 for value in product["specs"].values() if value.strip())
+        is_incomplete = not has_description and filled_spec_count <= 1
         result = {
             **generate_card_text(prepared, allow_short_description=is_incomplete),
             "specs": product["specs"],
