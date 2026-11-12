@@ -9,6 +9,13 @@ from llm import LLMError, generate_card_text
 REQUIRED_FIELDS = ("name", "manufacturer")
 OPTIONAL_TEXT_FIELDS = ("description", "productType", "article", "productCode")
 PRODUCT_FIELDS = {*REQUIRED_FIELDS, "specs", *OPTIONAL_TEXT_FIELDS}
+CLARIFICATION_LABELS = {
+    "specs": "технические характеристики",
+    "description": "описание товара",
+    "productType": "тип товара",
+    "article": "артикул",
+    "productCode": "код товара",
+}
 
 
 class InputError(ValueError):
@@ -87,6 +94,26 @@ def prepare_product(data):
     return {"product": product, "fieldsToClarify": fields_to_clarify}
 
 
+def build_short_description(product, fields_to_clarify):
+    description = f"Модель {product['name']} от производителя {product['manufacturer']}."
+    product_type = product.get("productType", "")
+    if product_type.strip():
+        description += f" Тип товара — {product_type}."
+
+    clarifications = []
+    for field in fields_to_clarify:
+        if field.startswith("specs."):
+            spec_name = field[len("specs."):]
+            clarifications.append(f"значение характеристики «{spec_name}»")
+        else:
+            clarifications.append(CLARIFICATION_LABELS[field])
+    description += f" Нужно уточнить {', '.join(clarifications)}."
+
+    if len(description) > 1200:
+        raise InputError("Короткое описание из исходных данных превышает 1200 символов.")
+    return description
+
+
 def main():
     parser = argparse.ArgumentParser(description="Формирует черновик карточки товара из JSON.")
     parser.add_argument("path", type=Path, help="Путь к JSON-файлу в UTF-8.")
@@ -98,12 +125,16 @@ def main():
         has_description = bool((product["description"] or "").strip())
         filled_spec_count = sum(1 for value in product["specs"].values() if value.strip())
         is_incomplete = not has_description and filled_spec_count <= 1
+        fields_to_clarify = prepared["fieldsToClarify"]
+        if is_incomplete:
+            short_description = build_short_description(product, fields_to_clarify)
         result = {
             **generate_card_text(prepared, allow_short_description=is_incomplete),
             "specs": product["specs"],
-            "fieldsToClarify": prepared["fieldsToClarify"],
+            "fieldsToClarify": fields_to_clarify,
         }
         if is_incomplete:
+            result["seo_description"] = short_description
             result["isIncomplete"] = True
     except (InputError, LLMError) as error:
         details = {"message": str(error)}
