@@ -1,12 +1,13 @@
 import json
-import os
 from contextlib import closing
-from http.client import HTTPException, HTTPSConnection
+from http.client import HTTPConnection, HTTPException
 from socket import timeout as SocketTimeout
 
 
-MODEL = "gpt-5.4-mini"
-TIMEOUT_SECONDS = 30
+MODEL = "qwen3:4b"
+OLLAMA_HOST = "127.0.0.1"
+OLLAMA_PORT = 11434
+TIMEOUT_SECONDS = 120
 
 CARD_PROMPT = """Ты готовишь черновик карточки товара для B2B-каталога. Пиши по-русски.
 В пользовательском сообщении передан JSON. product содержит сведения о товаре, а fieldsToClarify перечисляет пропуски.
@@ -25,18 +26,11 @@ FIELD_SCHEMAS = {
     **{field: {"type": "string"} for field in TEXT_FIELDS},
     "search_queries": {"type": "array", "items": {"type": "string"}},
 }
-RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "product_card_text",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": FIELD_SCHEMAS,
-            "required": list(FIELD_SCHEMAS),
-            "additionalProperties": False,
-        },
-    },
+CARD_SCHEMA = {
+    "type": "object",
+    "properties": FIELD_SCHEMAS,
+    "required": list(FIELD_SCHEMAS),
+    "additionalProperties": False,
 }
 
 
@@ -52,10 +46,6 @@ class ResponseValidationError(LLMError):
 
 
 def request_completion(prepared, allow_short_description, validation_errors):
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise LLMError("Задай переменную окружения OPENAI_API_KEY для вызова OpenAI.")
-
     model_input = {**prepared, "allowShortDescription": allow_short_description}
     if validation_errors:
         model_input["validationErrors"] = validation_errors
@@ -63,45 +53,44 @@ def request_completion(prepared, allow_short_description, validation_errors):
     payload = {
         "model": MODEL,
         "messages": [
-            {"role": "developer", "content": CARD_PROMPT},
+            {"role": "system", "content": CARD_PROMPT},
             {"role": "user", "content": json.dumps(model_input, ensure_ascii=False)},
         ],
-        "response_format": RESPONSE_FORMAT,
-        "store": False,
+        "format": CARD_SCHEMA,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0},
     }
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
     try:
-        with closing(HTTPSConnection("api.openai.com", timeout=TIMEOUT_SECONDS)) as connection:
-            connection.request(
-                "POST", "/v1/chat/completions", json.dumps(payload).encode("utf-8"), headers
-            )
+        with closing(HTTPConnection(OLLAMA_HOST, OLLAMA_PORT, timeout=TIMEOUT_SECONDS)) as connection:
+            connection.request("POST", "/api/chat", body, headers)
             response = connection.getresponse()
-            if response.status in (401, 403):
-                raise LLMError("OpenAI отклонил авторизацию. Проверь ключ OPENAI_API_KEY и его права.")
+            if response.status == 404:
+                raise LLMError(f"Модель {MODEL} не найдена в Ollama. Выполни `ollama pull {MODEL}`.")
             if response.status != 200:
-                raise LLMError(f"OpenAI вернул ошибку HTTP {response.status}.")
+                raise LLMError(f"Ollama вернула ошибку HTTP {response.status}.")
             return response.read()
     except (SocketTimeout, TimeoutError) as error:
-        raise LLMError(f"Таймаут при обращении к OpenAI ({TIMEOUT_SECONDS} с).") from error
+        raise LLMError(f"Таймаут при обращении к Ollama ({TIMEOUT_SECONDS} с).") from error
+    except ConnectionRefusedError as error:
+        raise LLMError(f"Ollama недоступна на {OLLAMA_HOST}:{OLLAMA_PORT}. Запусти Ollama.") from error
     except (OSError, HTTPException) as error:
-        raise LLMError("Не удалось получить ответ от OpenAI. Проверь сетевое подключение.") from error
-    except ValueError as error:
-        raise LLMError("Не удалось отправить запрос. Проверь формат ключа OPENAI_API_KEY.") from error
+        raise LLMError("Не удалось получить ответ от локального API Ollama.") from error
 
 
 def parse_completion(body, allow_short_description):
     try:
-        choice = json.loads(body)["choices"][0]
-        message = choice["message"]
-        finish_reason = choice["finish_reason"]
-    except (ValueError, KeyError, IndexError, TypeError, RecursionError) as error:
-        raise ResponseValidationError(["OpenAI вернул ответ в неожиданном формате."]) from error
+        response = json.loads(body)
+        message = response["message"]
+        done = response["done"]
+    except (ValueError, KeyError, TypeError, RecursionError) as error:
+        raise ResponseValidationError(["Ollama вернула ответ в неожиданном формате."]) from error
 
     if not isinstance(message, dict):
-        raise ResponseValidationError(["OpenAI вернул ответ в неожиданном формате."])
-    if message.get("refusal") or finish_reason == "content_filter":
-        raise LLMError("Модель отказалась формировать карточку.")
-    if finish_reason != "stop":
+        raise ResponseValidationError(["Ollama вернула ответ в неожиданном формате."])
+    if done is not True or response.get("done_reason") != "stop":
         raise ResponseValidationError(["Модель не завершила формирование карточки."])
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
